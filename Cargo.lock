@@ -3664,6 +3664,7 @@ dependencies = [
  "eyre",
  "futures",
  "humantime",
+ "jsonrpsee",
  "metrics",
  "metrics-util",
  "rstest",
