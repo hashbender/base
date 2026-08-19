@@ -1,0 +1,18 @@
+{
+  "upstream": "base/base",
+  "fork": "hashbender/base",
+  "since_pr": 4531,
+  "runner_large": "tenki-standard-large-plus-16c-32g",
+  "runner_medium": "tenki-standard-medium-4c-8g",
+  "pr_ci_bases": ["main"],
+  "decouple": {
+    "subs": [
+      [
+        "GH_TOKEN: ${{ secrets.BASE_STD_TOKEN }}",
+        "GH_TOKEN: ${{ github.repository == 'base/base' && secrets.BASE_STD_TOKEN || github.token }}"
+      ]
+    ],
+    "gate_jobs": ["review"],
+    "accept_skipped": false
+  }
+}
