@@ -59,8 +59,8 @@ impl AttestationPlanner {
             ));
         }
 
-        let root_cert = doc.cabundle[0].as_ref();
-        let root_hash = keccak256(root_cert);
+        let root_cert = doc.cabundle[0].as_ref().to_vec();
+        let root_hash = keccak256(&root_cert);
         if root_hash != PINNED_ROOT_CERT_HASH {
             return Err(PlannerError::Attestation(format!(
                 "attestation root certificate hash {root_hash} is not trusted"
@@ -101,6 +101,7 @@ impl AttestationPlanner {
             timestamp: doc.timestamp,
             nonce: doc.nonce.as_ref().map(|n| n.to_vec()),
             root_cert_hash: root_hash,
+            root_cert,
             leaf_cert_hash: leaf_hash,
             attestation_tbs: cose.attestation_tbs,
             signature: cose.signature,
@@ -310,6 +311,7 @@ mod tests {
         // Fixture encodes `nonce: null`.
         assert_eq!(plan.nonce, None);
         assert_eq!(plan.root_cert_hash, PINNED_ROOT_CERT_HASH);
+        assert_eq!(keccak256(&plan.root_cert), PINNED_ROOT_CERT_HASH);
         assert_eq!(plan.leaf_cert_hash, LEAF_HASH);
         assert_eq!(plan.signature.len(), 96);
         assert_eq!(keccak256(&plan.attestation_tbs), FIXTURE_TBS_KECCAK);

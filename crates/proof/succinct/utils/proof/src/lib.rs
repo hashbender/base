@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base_proof_succinct_elfs::AGGREGATION_ELF;
-use base_proof_succinct_host_utils::{fetcher::OPSuccinctDataFetcher, host::SuccinctHost};
+use base_proof_zk_witness::{fetcher::OPSuccinctDataFetcher, host::SuccinctHost};
 use serde::{Deserialize, Serialize};
 use sp1_cluster_artifact::{
     redis::RedisArtifactClient,
@@ -116,7 +116,7 @@ async fn cluster_proof_blocking(
     stdin: SP1Stdin,
     label: &str,
 ) -> Result<SP1ProofWithPublicValues> {
-    tracing::info!("Generating {label} proof via cluster");
+    tracing::info!(label = %label, "Generating proof via cluster");
     let timeout_hours = timeout_secs.div_ceil(3600).max(1);
     let cluster_elf = ClusterElf::NewElf(elf.to_vec());
     let ProofRequestResults { proof, .. } = tokio::time::timeout(

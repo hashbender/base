@@ -1,7 +1,12 @@
 //! RPC implementation for transaction submission, status queries, and pool management.
 
 use alloy_primitives::{Address, Bytes, TxHash};
-use base_execution_txpool::{BasePooledTransaction, MAX_VALIDITY_PREDICATES, ValidityPredicate};
+use base_execution_txpool::{
+    BasePooledTransaction, DEFAULT_MAX_VALIDITY_PREDICATES, ValidityPredicate,
+};
+use base_observability_events::{
+    TransactionEventProducer, TransactionEventType, transaction_event,
+};
 use jsonrpsee::{
     core::{RpcResult, async_trait, client::ClientT},
     http_client::{HttpClient, HttpClientBuilder},
@@ -36,8 +41,6 @@ pub struct SendRawTransactionValidityRequest {
     /// EIP-2718 encoded signed transaction.
     pub tx: Bytes,
     /// Experimental predicates transported to builders alongside the transaction.
-    ///
-    /// Predicates are not currently evaluated during block construction.
     pub validity: Vec<ValidityPredicate>,
 }
 
@@ -86,12 +89,18 @@ pub struct TransactionStatusApiImpl<Pool: TransactionPool> {
 #[derive(Debug, Clone)]
 pub struct SendRawTransactionValidityApiImpl<Pool> {
     pool: Pool,
+    max_validity_predicates: usize,
 }
 
 impl<Pool> SendRawTransactionValidityApiImpl<Pool> {
-    /// Creates a validity transaction ingress backed by the given pool.
+    /// Creates a validity transaction ingress backed by the given pool and default predicate limit.
     pub const fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self { pool, max_validity_predicates: DEFAULT_MAX_VALIDITY_PREDICATES }
+    }
+
+    /// Creates a validity transaction ingress with a predicate limit.
+    pub const fn with_max_validity_predicates(pool: Pool, max_validity_predicates: usize) -> Self {
+        Self { pool, max_validity_predicates }
     }
 }
 
@@ -154,16 +163,14 @@ where
         &self,
         request: SendRawTransactionValidityRequest,
     ) -> RpcResult<TxHash> {
-        if request.validity.len() > MAX_VALIDITY_PREDICATES {
-            return Err(ErrorObjectOwned::owned(
-                ErrorCode::InvalidParams.code(),
-                format!(
-                    "too many validity predicates: {} (maximum {MAX_VALIDITY_PREDICATES})",
-                    request.validity.len()
-                ),
-                None::<()>,
-            ));
-        }
+        ValidityPredicate::validate_batch(&request.validity, self.max_validity_predicates)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    ErrorCode::InvalidParams.code(),
+                    error.to_string(),
+                    None::<()>,
+                )
+            })?;
 
         let transaction = BasePooledTransaction::recover_raw_transaction(request.tx.as_ref())
             .map_err(|error| {
@@ -174,8 +181,17 @@ where
                 )
             })?;
         let tx_hash = *transaction.hash();
+        let _ = transaction_event!(
+            producer: TransactionEventProducer::BaseRethNode,
+            event_type: TransactionEventType::TxpoolSendRawTransactionValidity,
+            tx_hash: tx_hash,
+            data: {
+                "rpc_method" => "base_sendRawTransactionValidity",
+                "validity_predicates" => &request.validity,
+            },
+        );
 
-        // Retain the currently unenforced predicates for canonical forwarding to builders.
+        // Retain predicates for canonical forwarding to builders.
         self.pool
             .add_transaction(
                 TransactionOrigin::Private,
@@ -221,6 +237,7 @@ impl<Pool: TransactionPool + 'static> AdminTxPoolApiServer for AdminTxPoolApiImp
 #[cfg(test)]
 mod tests {
     use alloy_primitives::U256;
+    use base_observability_events::{TransactionEventBuilder, TransactionEventProducer};
     use httpmock::prelude::*;
     use reth_transaction_pool::{
         PoolTransaction, TransactionOrigin,
@@ -244,6 +261,31 @@ mod tests {
         }
     }
 
+    fn all_predicate_variants() -> Vec<ValidityPredicate> {
+        vec![
+            ValidityPredicate::Balance {
+                address: Address::repeat_byte(0x11),
+                op: base_execution_txpool::ValidityOperator::GreaterThanOrEqual,
+                value: U256::from(1),
+            },
+            ValidityPredicate::Storage {
+                address: Address::repeat_byte(0xab),
+                slot: U256::from(1),
+                mask: U256::MAX,
+                op: base_execution_txpool::ValidityOperator::Equal,
+                value: U256::from(0x789),
+            },
+            ValidityPredicate::BlockNumber {
+                op: base_execution_txpool::ValidityOperator::GreaterThanOrEqual,
+                value: U256::from(100),
+            },
+            ValidityPredicate::FlashblockIndex {
+                op: base_execution_txpool::ValidityOperator::LessThan,
+                value: U256::from(5),
+            },
+        ]
+    }
+
     #[test]
     fn send_raw_transaction_validity_request_uses_top_level_keys() {
         let request = validity_request(Bytes::from_static(&[0x02]));
@@ -252,6 +294,65 @@ mod tests {
         assert_eq!(value["tx"], "0x02");
         assert_eq!(value["validity"][0]["type"], "storage");
         assert_eq!(value["validity"][0]["params"]["slot"], "0x1");
+    }
+
+    #[test]
+    fn send_raw_transaction_validity_event_data_serializes_all_predicate_variants() {
+        assert_eq!(
+            serde_json::to_value(all_predicate_variants()).unwrap(),
+            json!([
+                {
+                    "type": "balance",
+                    "params": {
+                        "address": "0x1111111111111111111111111111111111111111",
+                        "op": ">=",
+                        "value": "0x1",
+                    },
+                },
+                {
+                    "type": "storage",
+                    "params": {
+                        "address": "0xabababababababababababababababababababab",
+                        "slot": "0x1",
+                        "mask": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                        "op": "=",
+                        "value": "0x789",
+                    },
+                },
+                {
+                    "type": "block_number",
+                    "params": {
+                        "op": ">=",
+                        "value": "0x64",
+                    },
+                },
+                {
+                    "type": "flashblock_index",
+                    "params": {
+                        "op": "<",
+                        "value": "0x5",
+                    },
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn send_raw_transaction_validity_event_envelope_joins_on_tx_hash() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let event = TransactionEventBuilder::new(
+            TransactionEventProducer::BaseRethNode,
+            TransactionEventType::TxpoolSendRawTransactionValidity,
+        )
+        .tx_hash(tx_hash)
+        .data_field("rpc_method", json!("base_sendRawTransactionValidity"))
+        .data_field("validity_predicates", json!(all_predicate_variants()))
+        .build_with_network("base-devnet");
+
+        event.validate().expect("admission event should be valid");
+        assert_eq!(event.event_type.to_string(), "TXPOOL_SEND_RAW_TRANSACTION_VALIDITY");
+        assert_eq!(event.tx_hash, Some(tx_hash));
+        assert!(event.data.contains_key("validity_predicates"));
     }
 
     #[test]
@@ -280,12 +381,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_raw_transaction_validity_rejects_too_many_predicates() {
-        let rpc = SendRawTransactionValidityApiImpl::new(NoopTransactionPool::<
-            BasePooledTransaction,
-        >::new());
+    async fn send_raw_transaction_validity_enforces_configured_predicate_limit() {
+        let rpc = SendRawTransactionValidityApiImpl::with_max_validity_predicates(
+            NoopTransactionPool::<BasePooledTransaction>::new(),
+            2,
+        );
         let mut request = validity_request(Bytes::from_static(&[0x02]));
-        request.validity = vec![request.validity[0].clone(); MAX_VALIDITY_PREDICATES + 1];
+        request.validity = vec![request.validity[0].clone(); 3];
 
         let error = rpc
             .send_raw_transaction_validity(request)
@@ -294,6 +396,47 @@ mod tests {
 
         assert_eq!(error.code(), ErrorCode::InvalidParams.code());
         assert!(error.message().contains("too many validity predicates"));
+        assert!(error.message().contains("maximum 2"));
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_validity_rejects_empty_predicates() {
+        let rpc = SendRawTransactionValidityApiImpl::new(NoopTransactionPool::<
+            BasePooledTransaction,
+        >::new());
+        let mut request = validity_request(Bytes::from_static(&[0x02]));
+        request.validity.clear();
+
+        let error = rpc
+            .send_raw_transaction_validity(request)
+            .await
+            .expect_err("empty validity should be rejected before transaction decoding");
+
+        assert_eq!(error.code(), ErrorCode::InvalidParams.code());
+        assert!(error.message().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_validity_rejects_storage_value_outside_mask() {
+        let rpc = SendRawTransactionValidityApiImpl::new(NoopTransactionPool::<
+            BasePooledTransaction,
+        >::new());
+        let mut request = validity_request(Bytes::from_static(&[0x02]));
+        request.validity = vec![ValidityPredicate::Storage {
+            address: Address::repeat_byte(0xab),
+            slot: U256::from(1),
+            mask: U256::from(0xff),
+            op: base_execution_txpool::ValidityOperator::Equal,
+            value: U256::from(0x1ff),
+        }];
+
+        let error = rpc
+            .send_raw_transaction_validity(request)
+            .await
+            .expect_err("storage value outside its mask should be rejected");
+
+        assert_eq!(error.code(), ErrorCode::InvalidParams.code());
+        assert!(error.message().contains("outside its mask"));
     }
 
     #[tokio::test]

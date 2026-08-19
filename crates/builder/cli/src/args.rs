@@ -4,9 +4,11 @@ use core::{net::SocketAddr, time::Duration};
 use std::path::PathBuf;
 
 use base_builder_core::{
-    BuilderConfig, ExecutionMeteringMode, RejectionCache, SharedMeteringProvider,
+    BuilderApiExtensionConfig, BuilderConfig, DEFAULT_MAX_VALIDITY_PREDICATES,
+    ExecutionMeteringMode, RejectionCache, ShadowValidityConfig, SharedMeteringProvider,
 };
 use base_builder_metering::MeteringStore;
+use base_execution_cli::ShadowIndexerArgs;
 use base_node_core::{HasRollupArgs, RollupArgs};
 use base_observability_events::{
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILES, DEFAULT_QUEUE_CAPACITY, TransactionEventProducer,
@@ -185,9 +187,31 @@ pub struct Args {
 
     /// Accept experimental validity-bearing transactions from forwarding nodes.
     ///
-    /// Predicates are preserved but are not yet enforced during block construction.
+    /// Predicates are preserved and enforced during block construction.
     #[arg(long = "builder.enable-experimental-validity-transactions", default_value = "false")]
     pub enable_experimental_validity_transactions: bool,
+
+    /// Maximum validity predicates accepted per experimental transaction.
+    #[arg(
+        long = "builder.experimental-validity-max-predicates",
+        default_value_t = DEFAULT_MAX_VALIDITY_PREDICATES,
+        requires = "enable_experimental_validity_transactions"
+    )]
+    pub experimental_validity_max_predicates: usize,
+
+    /// Decorate sampled ordinary transactions with a behavior-preserving validity predicate.
+    ///
+    /// This must only be enabled on a shadow builder.
+    #[arg(long = "builder.shadow-validity-injection.enabled", default_value = "false")]
+    pub shadow_validity_injection_enabled: bool,
+
+    /// Sampling rate for shadow validity injection, in basis points.
+    #[arg(
+        long = "builder.shadow-validity-injection.sample-rate-bps",
+        default_value = "100",
+        value_parser = clap::builder::RangedU64ValueParser::<u16>::new().range(1..=10_000)
+    )]
+    pub shadow_validity_injection_sample_rate_bps: u16,
 
     /// Maximum cumulative uncompressed (EIP-2718 encoded) block size in bytes
     #[arg(long = "builder.max-uncompressed-block-size")]
@@ -248,6 +272,10 @@ pub struct Args {
     /// Transaction event journal configuration
     #[command(flatten)]
     pub transaction_events: TransactionEventsArgs,
+
+    /// Shadow indexer `ExEx` configuration
+    #[command(flatten)]
+    pub shadow_indexer: ShadowIndexerArgs,
 }
 
 impl HasRollupArgs for Args {
@@ -282,6 +310,9 @@ impl Default for Args {
             extra_block_deadline_secs: 20,
             enable_resource_metering: false,
             enable_experimental_validity_transactions: false,
+            experimental_validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
+            shadow_validity_injection_enabled: false,
+            shadow_validity_injection_sample_rate_bps: 100,
             max_uncompressed_block_size: None,
             metering_wait_duration_ms: None,
             audit_archiver_url: None,
@@ -295,11 +326,30 @@ impl Default for Args {
             manifest_precheck_enabled: true,
             flashblocks: FlashblocksArgs::default(),
             transaction_events: TransactionEventsArgs::default(),
+            shadow_indexer: ShadowIndexerArgs::default(),
         }
     }
 }
 
 impl Args {
+    /// Builds validated configuration for the builder transaction insertion RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shadow injection is enabled without validity transaction support.
+    pub fn builder_api_config(&self) -> eyre::Result<BuilderApiExtensionConfig> {
+        let shadow_validity = if self.shadow_validity_injection_enabled {
+            ShadowValidityConfig::enabled(self.shadow_validity_injection_sample_rate_bps)?
+        } else {
+            ShadowValidityConfig::disabled()
+        };
+        Ok(BuilderApiExtensionConfig::new(
+            self.enable_experimental_validity_transactions,
+            self.experimental_validity_max_predicates,
+        )
+        .with_shadow_validity(shadow_validity)?)
+    }
+
     /// Converts these CLI arguments into a [`BuilderConfig`] using the given shared metering
     /// provider. The same provider must also be passed to the RPC extension so that the
     /// building loop and the `base_setMeteringInformation` handler share a single store.
@@ -382,6 +432,10 @@ mod tests {
     fn default_args_produce_valid_config() {
         let args = Args::default();
         assert!(!args.enable_experimental_validity_transactions);
+        assert_eq!(args.experimental_validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
+        assert!(!args.shadow_validity_injection_enabled);
+        assert_eq!(args.shadow_validity_injection_sample_rate_bps, 100);
+        assert!(!args.builder_api_config().unwrap().shadow_validity.is_enabled());
         let config = convert(args);
         assert_eq!(config.block_time, Duration::from_millis(1000));
         assert!(config.max_gas_per_txn.is_none());
@@ -393,9 +447,38 @@ mod tests {
         let parsed = CommandParser::parse_from([
             "builder",
             "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            "8",
         ]);
 
         assert!(parsed.args.enable_experimental_validity_transactions);
+        assert_eq!(parsed.args.experimental_validity_max_predicates, 8);
+    }
+
+    #[test]
+    fn shadow_validity_injection_requires_validity_support() {
+        let args = Args { shadow_validity_injection_enabled: true, ..Default::default() };
+        assert!(args.builder_api_config().is_err());
+
+        let args = Args {
+            enable_experimental_validity_transactions: true,
+            shadow_validity_injection_enabled: true,
+            shadow_validity_injection_sample_rate_bps: 250,
+            ..Default::default()
+        };
+        let config = args.builder_api_config().unwrap();
+        assert!(config.shadow_validity.is_enabled());
+        assert_eq!(config.shadow_validity.sample_rate_basis_points(), 250);
+    }
+
+    #[test]
+    fn shadow_validity_sampling_rate_is_cli_bounded() {
+        let result = CommandParser::try_parse_from([
+            "builder",
+            "--builder.shadow-validity-injection.sample-rate-bps",
+            "10001",
+        ]);
+        assert!(result.is_err());
     }
 
     #[rstest]

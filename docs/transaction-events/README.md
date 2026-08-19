@@ -9,6 +9,15 @@ Vector tails these same JSONL files and ships newline-delimited event records to
 `audit-archiver`. The audit HTTP ingest endpoint is collector-facing and expects
 one event JSON object per line, not a wrapped JSON batch.
 
+## Postgres Retention
+
+`audit-archiver` stores events in Postgres for operational queries. Postgres is
+not the long-term archive. A background worker deletes rows by event type:
+high-volume proxy and builder-decision events default to 3 days, ingress and
+forwarding events default to 7 days, and failures, drops, inclusion, and
+flashblock events default to 30 days. Autovacuum reclaims the resulting table
+bloat.
+
 ## Configuration Fields
 
 Rust producers should expose these config fields directly or with a
@@ -179,6 +188,22 @@ Mempool/node:
 - `TXPOOL_DROPPED`
 - `TXPOOL_REPLACED`
 - `TXPOOL_TRACKING_OVERFLOWED`
+- `TXPOOL_SEND_RAW_TRANSACTION`
+- `TXPOOL_SEND_RAW_TRANSACTION_VALIDITY`
+
+`TXPOOL_SEND_RAW_TRANSACTION` and `TXPOOL_SEND_RAW_TRANSACTION_VALIDITY` are
+one-time RPC-admission events, one per unique submit path. They fire after the
+transaction is decoded and before sequencer forwarding or pool insertion.
+`tx_hash` is the join key. They are distinct from `TXPOOL_PENDING` /
+`TXPOOL_QUEUED`, which record later subpool membership.
+`TXPOOL_SEND_RAW_TRANSACTION_VALIDITY` is the only event that records
+`data.validity_predicates` (the serialized `balance`, `storage`,
+`block_number`, and `flashblock_index` list). Downstream lifecycle events do
+not repeat that list; join them back by `tx_hash`. A replacement is a fresh
+admission with its own `tx_hash` and/or predicate list;
+`TXPOOL_REPLACED.replacement_hash` links the outgoing transaction to the
+incoming one. `base_insertValidatedTransaction` uses
+`TXPOOL_VALIDATED_INSERT_ACCEPTED` / `TXPOOL_VALIDATED_INSERT_REJECTED`.
 
 Forwarding:
 

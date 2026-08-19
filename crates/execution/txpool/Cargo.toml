@@ -15,7 +15,7 @@ workspace = true
 # ethereum
 alloy-eips.workspace = true
 alloy-consensus.workspace = true
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["map-foldhash"] }
 
 # reth
 reth-evm.workspace = true
@@ -74,6 +74,7 @@ default = [ "metrics" ]
 metrics = [
 	"base-common-evm/metrics",
 	"base-metrics/metrics",
+	"base-observability-events/metrics",
 	"dep:metrics",
 	"reth-evm/metrics",
 ]

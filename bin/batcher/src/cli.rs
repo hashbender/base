@@ -90,12 +90,6 @@ pub(crate) struct BatcherArgs {
     )]
     pub rollup_rpc_url: Vec<Url>,
 
-    /// Optional L1 beacon API endpoint.
-    ///
-    /// Used by shadow-mode parity monitoring to fetch EIP-4844 blob sidecars.
-    #[arg(long = "l1-beacon-url", env = "BATCHER_L1_BEACON_URL")]
-    pub l1_beacon_url: Option<Url>,
-
     /// Signer configuration.
     #[command(flatten)]
     pub signer: SignerCli,
@@ -160,13 +154,6 @@ pub(crate) struct BatcherArgs {
         env = "BATCHER_DATA_AVAILABILITY_TYPE"
     )]
     da_type: base_batcher_encoder::DaType,
-
-    /// Approximate compression ratio used for span batch size estimation.
-    ///
-    /// Only relevant when `--batch-type=span`. Should be slightly below the
-    /// typical observed ratio to avoid creating a small leftover frame.
-    #[arg(long = "approx-compr-ratio", default_value = "0.6", env = "BATCHER_APPROX_COMPR_RATIO")]
-    pub approx_compr_ratio: f64,
 
     /// Maximum number of in-flight (unconfirmed) transactions.
     #[arg(
@@ -310,7 +297,6 @@ impl BatcherArgs {
             max_blocks_per_span_batch: self.max_blocks_per_span_batch,
             batch_type: self.batch_type.into(),
             da_type: self.da_type,
-            approx_compr_ratio: self.approx_compr_ratio,
             // The batcher binary only targets post-Fjord chains, so it always uses Brotli.
             compression_algo: base_batcher_encoder::CompressionAlgo::Brotli10,
             max_l1_tx_size_bytes: self.max_l1_tx_size_bytes,
@@ -322,7 +308,6 @@ impl BatcherArgs {
             l2_rpc_url: self.l2_rpc_url,
             parity_validator_l2_rpc_url: self.parity_validator_l2_rpc_url,
             rollup_rpc_url: self.rollup_rpc_url,
-            l1_beacon_url: self.l1_beacon_url,
             signer: Some(signer),
             metrics_enabled: self.metrics.enabled,
             batch_inbox_override: self.dangerously_override_batch_inbox_address,
@@ -510,11 +495,11 @@ mod tests {
     }
 
     #[test]
-    fn into_config_rejects_one_max_blocks_per_span_batch() {
+    fn into_config_accepts_one_max_blocks_per_span_batch() {
         let cli = parse_cli(&["--max-blocks-per-span-batch", "1"]);
-        let err = cli.args.into_config().expect_err("one-block span batch cap should fail");
+        let config = cli.args.into_config().expect("one-block span batch cap should be valid");
 
-        assert!(err.to_string().contains("max_blocks_per_span_batch"));
+        assert_eq!(config.encoder_config.max_blocks_per_span_batch, Some(1));
     }
 
     #[test]
@@ -595,14 +580,6 @@ mod tests {
         assert_eq!(config.l1_rpc_url.len(), 1);
         assert_eq!(config.l2_rpc_url.len(), 1);
         assert_eq!(config.rollup_rpc_url.len(), 1);
-    }
-
-    #[test]
-    fn into_config_accepts_l1_beacon_url() {
-        let cli = parse_cli(&["--l1-beacon-url", "http://localhost:5052"]);
-        let config = cli.args.into_config().expect("config should build");
-
-        assert_eq!(config.l1_beacon_url.unwrap().as_str(), "http://localhost:5052/");
     }
 
     #[test]

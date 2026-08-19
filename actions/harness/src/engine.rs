@@ -334,6 +334,12 @@ impl ActionEngineClient {
         inner.executed_receipts.get(&block_number).cloned()
     }
 
+    /// Return the executed hash for an L2 block number.
+    pub fn block_hash_at(&self, block_number: u64) -> Option<B256> {
+        let inner = self.inner.lock().expect("engine client lock");
+        inner.executed_infos.get(&block_number).map(|info| info.block_info.hash)
+    }
+
     /// Check whether an account has non-empty code deployed.
     ///
     /// Returns `true` if the account exists and has code, `false` otherwise.
@@ -452,7 +458,12 @@ impl ActionEngineClient {
             let hashed_state = HashedPostStateProvider::hashed_post_state(
                 &LatestStateProviderRef::new(&state_provider),
                 &execution_output.state,
-            );
+            )
+            .map_err(|e| {
+                TransportError::from(TransportErrorKind::custom_str(&format!(
+                    "failed to calculate hashed_post_state: {e}"
+                )))
+            })?;
             drop(state_provider);
 
             let provider_rw = inner.provider_factory.provider_rw().map_err(|e| {

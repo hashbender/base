@@ -1,11 +1,14 @@
 //! Lane-aware parking over an existing best-transactions iterator.
 
 use std::{
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, VecDeque},
     sync::Arc,
 };
 
-use alloy_primitives::{Address, TxHash, U256};
+use alloy_primitives::{
+    Address, TxHash, U256,
+    map::{HashMap, hash_map::Entry},
+};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionOrdering,
     TransactionPool, ValidPoolTransaction, error::InvalidPoolTransactionError,
@@ -58,12 +61,6 @@ where
     /// Temporarily parks a transaction that was yielded by this iterator.
     fn park(&mut self, transaction: &Arc<ValidPoolTransaction<T>>);
 
-    /// Returns a snapshot of the currently predicate-parked transactions.
-    ///
-    /// The snapshot owns cloned transaction handles so callers can promote or discard entries
-    /// while scanning it without retaining an immutable borrow of the iterator.
-    fn parked_transactions(&self) -> Vec<Arc<ValidPoolTransaction<T>>>;
-
     /// Makes a parked transaction eligible to compete by priority again.
     fn promote(&mut self, transaction_hash: TxHash) -> bool;
 
@@ -106,7 +103,6 @@ where
     base_fee: u64,
     source_head: Option<Arc<ValidPoolTransaction<T>>>,
     lanes: HashMap<BestTransactionLane, BestTransactionLaneState<T>>,
-    in_flight: HashMap<TxHash, Arc<ValidPoolTransaction<T>>>,
     parked: HashMap<TxHash, Arc<ValidPoolTransaction<T>>>,
     ready: HashMap<TxHash, Arc<ValidPoolTransaction<T>>>,
     ready_heap: BinaryHeap<(BestTransactionPriority<O::PriorityValue>, TxHash)>,
@@ -121,7 +117,6 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParkedBestTransactions")
             .field("lanes", &self.lanes.len())
-            .field("in_flight", &self.in_flight.len())
             .field("parked", &self.parked.len())
             .field("ready", &self.ready.len())
             .finish_non_exhaustive()
@@ -141,10 +136,9 @@ where
             ordering,
             base_fee,
             source_head: None,
-            lanes: HashMap::new(),
-            in_flight: HashMap::new(),
-            parked: HashMap::new(),
-            ready: HashMap::new(),
+            lanes: HashMap::default(),
+            parked: HashMap::default(),
+            ready: HashMap::default(),
             ready_heap: BinaryHeap::new(),
         }
     }
@@ -170,14 +164,21 @@ where
 
     /// Releases the next buffered transaction in a committed lane.
     pub fn release_lane(&mut self, lane: BestTransactionLane) {
-        let next = match self.lanes.get_mut(&lane) {
-            Some(BestTransactionLaneState::Occupied(buffered)) => buffered.pop_front(),
-            Some(BestTransactionLaneState::Invalid) | None => return,
+        let next = match self.lanes.entry(lane) {
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                BestTransactionLaneState::Occupied(buffered) => {
+                    let next = buffered.pop_front();
+                    if next.is_none() {
+                        entry.remove();
+                    }
+                    next
+                }
+                BestTransactionLaneState::Invalid => return,
+            },
+            Entry::Vacant(_) => return,
         };
         if let Some(next) = next {
             self.push_ready(next);
-        } else {
-            self.lanes.remove(&lane);
         }
     }
 
@@ -202,9 +203,6 @@ where
             BestTransactionLane::for_transaction(transaction) != Some(lane)
         });
         self.ready_heap.retain(|(_, hash)| self.ready.contains_key(hash));
-        self.in_flight.retain(|_, transaction| {
-            BestTransactionLane::for_transaction(transaction) != Some(lane)
-        });
     }
 
     /// Pulls through blocked descendants until the next source candidate is lane-eligible.
@@ -262,7 +260,6 @@ where
                 .entry(lane)
                 .or_insert_with(|| BestTransactionLaneState::Occupied(VecDeque::new()));
         }
-        self.in_flight.insert(*transaction.hash(), Arc::clone(&transaction));
         transaction
     }
 }
@@ -303,10 +300,6 @@ where
     O: TransactionOrdering<Transaction = T>,
 {
     fn mark_invalid(&mut self, transaction: &Self::Item, kind: InvalidPoolTransactionError) {
-        let hash = *transaction.hash();
-        self.in_flight.remove(&hash);
-        self.parked.remove(&hash);
-        self.ready.remove(&hash);
         if let Some(lane) = BestTransactionLane::for_transaction(transaction) {
             self.invalidate_lane(lane);
         }
@@ -330,13 +323,7 @@ where
 {
     fn park(&mut self, transaction: &Arc<ValidPoolTransaction<T>>) {
         let hash = *transaction.hash();
-        if let Some(transaction) = self.in_flight.remove(&hash) {
-            self.parked.insert(hash, transaction);
-        }
-    }
-
-    fn parked_transactions(&self) -> Vec<Arc<ValidPoolTransaction<T>>> {
-        self.parked.values().cloned().collect()
+        self.parked.insert(hash, Arc::clone(transaction));
     }
 
     fn promote(&mut self, transaction_hash: TxHash) -> bool {
@@ -363,10 +350,6 @@ where
     }
 
     fn mark_committed(&mut self, transaction: &Arc<ValidPoolTransaction<T>>) {
-        let hash = *transaction.hash();
-        self.in_flight.remove(&hash);
-        self.parked.remove(&hash);
-        self.ready.remove(&hash);
         if let Some(lane) = BestTransactionLane::for_transaction(transaction) {
             self.release_lane(lane);
         }

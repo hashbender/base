@@ -17,7 +17,10 @@ pub use driver::{
 };
 
 mod error;
-pub use error::{PlannerError, PlannerResult, RegistrarError, Result};
+pub use error::{HintError, HintResult, PlannerError, PlannerResult, RegistrarError, Result};
+
+mod hints;
+pub use hints::P384Hints;
 
 mod metrics;
 pub use metrics::RegistrarMetrics;
@@ -33,8 +36,8 @@ pub use prover::ProverClient;
 
 mod signer_manager;
 pub use signer_manager::{
-    DEFAULT_MAX_TX_RETRIES, DEFAULT_TX_RETRY_DELAY_SECS, PendingRegistration, ProofTaskSet,
-    SignerManager, SignerManagerConfig,
+    CacheTxAttempt, DEFAULT_MAX_TX_RETRIES, DEFAULT_TX_RETRY_DELAY_SECS, PendingRegistration,
+    ProofTaskSet, SignerManager, SignerManagerConfig,
 };
 
 mod service;
@@ -44,7 +47,9 @@ mod traits;
 pub use traits::{EnclaveEndpointClient, InstanceDiscovery};
 
 mod types;
-pub use types::{CertKind, CertPlan, InstanceHealthStatus, ProverInstance, RegistrationPlan};
+pub use types::{
+    CertKind, CertPlan, InstanceHealthStatus, ProverInstance, RegistrationHints, RegistrationPlan,
+};
 
 #[cfg(test)]
 pub mod test_utils;

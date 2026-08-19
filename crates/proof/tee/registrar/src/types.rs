@@ -68,6 +68,8 @@ pub struct RegistrationPlan {
     pub nonce: Option<Vec<u8>>,
     /// Pinned root certificate cache key (`keccak256(full DER)`).
     pub root_cert_hash: B256,
+    /// DER-encoded pinned root certificate used to generate the first CA hint stream.
+    pub root_cert: Vec<u8>,
     /// Leaf certificate cache key (`keccak256(TBSCertificate TLV)`).
     pub leaf_cert_hash: B256,
     /// COSE `Sig_structure` bytes (attestation TBS).
@@ -76,4 +78,16 @@ pub struct RegistrationPlan {
     pub signature: Vec<u8>,
     /// Non-root CAs (parent-first) followed by the leaf certificate.
     pub certs: Vec<CertPlan>,
+}
+
+/// Packed P-384 inverse-hint streams for one registration plan.
+///
+/// Each stream is `inverse_0 ‖ … ‖ inverse_{k-1}` with 48-byte big-endian limbs
+/// in the exact order consumed by onchain `P384Verifier`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistrationHints {
+    /// Hint stream for each entry in [`RegistrationPlan::certs`] (same order).
+    pub cert_signature_hints: Vec<Vec<u8>>,
+    /// Hint stream for the attestation COSE signature.
+    pub attestation_hints: Vec<u8>,
 }

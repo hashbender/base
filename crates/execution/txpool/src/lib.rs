@@ -29,7 +29,8 @@ mod best;
 
 mod validity;
 pub use validity::{
-    MAX_VALIDITY_PREDICATES, TransactionValidity, ValidityOperator, ValidityPredicate,
+    DEFAULT_MAX_VALIDITY_PREDICATES, PredicateContext, TransactionValidity, ValidityOperator,
+    ValidityPredicate, ValidityPredicateError,
 };
 
 mod transaction;
