@@ -38,10 +38,10 @@ jobs:
       matrix:
         settings:
           - platform: linux/amd64
-            runs-on: ubuntu-24.04
+            runs-on: tenki-standard-medium-4c-8g
             smoke_test: true
           - platform: linux/arm64
-            runs-on: ubuntu-24.04-arm
+            runs-on: tenki-standard-medium-4c-8g
             smoke_test: false
 
     runs-on: ${{ matrix.settings.runs-on }}
@@ -116,7 +116,7 @@ jobs:
         id: base-std
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.BASE_STD_TOKEN }}
+          GH_TOKEN: ${{ github.repository == 'base/base' && secrets.BASE_STD_TOKEN || github.token }}
         run: |
           set -euo pipefail
 
@@ -158,7 +158,7 @@ jobs:
         if: matrix.settings.smoke_test
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.BASE_STD_TOKEN }}
+          GH_TOKEN: ${{ github.repository == 'base/base' && secrets.BASE_STD_TOKEN || github.token }}
           BASE_STD_SHA: ${{ steps.base-std.outputs.sha }}
         run: |
           set -euo pipefail
@@ -312,7 +312,7 @@ jobs:
   merge:
     name: Publish manifest
     needs: build-and-push
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     permissions:
       contents: read
       packages: write
