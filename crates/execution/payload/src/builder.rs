@@ -758,6 +758,7 @@ where
         let base_fee = builder.evm_mut().block().basefee();
 
         let block_timestamp = self.attributes().timestamp();
+        let can_finalize_early = self.is_denim_active();
         while let Some(tx) = best_txs.next(()) {
             if self.builder_config.manifest_precheck_enabled
                 && let Some(manifest) = tx.watch_manifest()
@@ -839,9 +840,11 @@ where
                 continue;
             }
 
-            // check if the job was cancelled, if so we can exit early
             if self.cancel.is_cancelled() {
                 return Ok(Some(()));
+            }
+            if can_finalize_early && self.cancel.is_finalization_requested() {
+                break;
             }
 
             let gas_output = match builder.execute_transaction(tx.clone()) {
@@ -872,16 +875,21 @@ where
             info.total_fees += U256::from(miner_fee) * U256::from(gas_output.tx_gas_used());
         }
 
+        if self.cancel.is_cancelled() {
+            return Ok(Some(()));
+        }
+
         Ok(None)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, mem::ManuallyDrop, sync::Arc};
 
-    use alloy_consensus::Header;
-    use alloy_primitives::{B256, StorageKey, U256};
+    use alloy_consensus::{Header, SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_primitives::{Address, B256, Signature, StorageKey, TxKind, U256};
     use base_common_chains::BaseUpgrade;
     use base_common_consensus::{BasePrimitives, BaseTxEnvelope, Predeploys};
     use base_common_evm::BaseTime;
@@ -892,10 +900,13 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use reth_ethereum_forks::ForkCondition;
     use reth_payload_builder::PayloadId;
-    use reth_payload_util::NoopPayloadTransactions;
-    use reth_primitives_traits::{Account, SealedHeader};
+    use reth_payload_util::{NoopPayloadTransactions, PayloadTransactions};
+    use reth_primitives_traits::{Account, SealedHeader, SignedTransaction};
     use reth_provider::noop::NoopProvider;
-    use reth_revm::{database::StateProviderDatabase, test_utils::StateProviderTest};
+    use reth_revm::{
+        cancelled::CancelOnDrop, database::StateProviderDatabase, test_utils::StateProviderTest,
+    };
+    use reth_transaction_pool::PoolTransaction;
     use reth_trie_common::{HashedPostState, updates::TrieUpdates};
     use reth_trie_parallel::{
         error::StateRootTaskError,
@@ -998,9 +1009,7 @@ mod tests {
 
     const DENIM_TIMESTAMP: u64 = 1;
 
-    fn build_pool_payload(
-        timestamp: u64,
-    ) -> BuildOutcomeKind<crate::BaseBuiltPayload<BasePrimitives>> {
+    fn pool_payload_context(timestamp: u64) -> BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec> {
         let chain_spec = Arc::new(
             BaseChainSpecBuilder::base_mainnet()
                 .with_fork(BaseUpgrade::Denim, ForkCondition::Timestamp(DENIM_TIMESTAMP))
@@ -1022,14 +1031,23 @@ mod tests {
             gas_limit: Some(parent.gas_limit),
             ..Default::default()
         };
-        let ctx = BasePayloadBuilderCtx {
+        BasePayloadBuilderCtx {
             evm_config: BaseEvmConfig::<_, BasePrimitives>::base(Arc::clone(&chain_spec)),
             builder_config: BaseBuilderConfig::default(),
             chain_spec,
             config: PayloadConfig::new(parent, attributes, payload_id),
             cancel: Default::default(),
             best_payload: None,
-        };
+        }
+    }
+
+    fn build_pool_payload<Txs>(
+        ctx: BasePayloadBuilderCtx<BaseEvmConfig, BaseChainSpec>,
+        transactions: Txs,
+    ) -> BuildOutcomeKind<crate::BaseBuiltPayload<BasePrimitives>>
+    where
+        Txs: PayloadTransactions<Transaction = BasePooledTransaction> + Send + Sync,
+    {
         let mut storage = HashMap::default();
         storage.insert(
             StorageKey::from(BaseTime::ADMIN_SLOT.to_be_bytes::<32>()),
@@ -1042,18 +1060,98 @@ mod tests {
             Some(BaseTime::proxy_bytecode()),
             storage,
         );
-        Builder::new(|_| NoopPayloadTransactions::<BasePooledTransaction>::default())
+        provider.insert_account(
+            pool_transaction(0).sender(),
+            Account { balance: U256::MAX, ..Default::default() },
+            None,
+            HashMap::default(),
+        );
+        Builder::new(|_| transactions)
             .build(StateProviderDatabase::new(&provider), &provider, Some(state_root_handle()), ctx)
             .expect("payload must build")
     }
 
-    #[test]
-    fn pre_denim_pool_payload_remains_better() {
-        assert!(matches!(build_pool_payload(DENIM_TIMESTAMP - 1), BuildOutcomeKind::Better { .. }));
+    fn pool_transaction(nonce: u64) -> BasePooledTransaction {
+        let envelope = BaseTxEnvelope::Eip1559(
+            TxEip1559 {
+                chain_id: 8_453,
+                nonce,
+                gas_limit: 100_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: TxKind::Call(Address::repeat_byte(0x11)),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature()),
+        );
+        let encoded_len = envelope.encode_2718_len();
+        BasePooledTransaction::new(
+            envelope.try_into_recovered().expect("test signature must recover"),
+            encoded_len,
+        )
+    }
+
+    struct FinalizeAfterFirstTransaction {
+        transactions: std::vec::IntoIter<BasePooledTransaction>,
+        calls: usize,
+        // Models the resolver retaining its clone until the finalized payload is returned.
+        cancel: ManuallyDrop<CancelOnDrop>,
+    }
+
+    impl PayloadTransactions for FinalizeAfterFirstTransaction {
+        type Transaction = BasePooledTransaction;
+
+        fn next(&mut self, _ctx: ()) -> Option<Self::Transaction> {
+            self.calls += 1;
+            if self.calls == 2 {
+                self.cancel.request_finalization();
+            }
+            self.transactions.next()
+        }
+
+        fn mark_invalid(&mut self, _sender: Address, _nonce: u64) {}
     }
 
     #[test]
-    fn denim_pool_payload_freezes() {
-        assert!(matches!(build_pool_payload(DENIM_TIMESTAMP), BuildOutcomeKind::Freeze(_)));
+    fn pre_denim_ignores_finalization_requests() {
+        let ctx = pool_payload_context(DENIM_TIMESTAMP - 1);
+        ctx.cancel.request_finalization();
+        let transactions = FinalizeAfterFirstTransaction {
+            transactions: vec![pool_transaction(0)].into_iter(),
+            calls: 0,
+            cancel: ManuallyDrop::new(ctx.cancel.clone()),
+        };
+
+        let BuildOutcomeKind::Better { payload } = build_pool_payload(ctx, transactions) else {
+            panic!("pre-Denim payload must remain eligible for improvement")
+        };
+        assert_eq!(payload.block().body().transactions.len(), 1);
+    }
+
+    #[test]
+    fn denim_finalization_preserves_completed_pool_transactions() {
+        let ctx = pool_payload_context(DENIM_TIMESTAMP);
+        let transactions = FinalizeAfterFirstTransaction {
+            transactions: vec![pool_transaction(0), pool_transaction(1)].into_iter(),
+            calls: 0,
+            cancel: ManuallyDrop::new(ctx.cancel.clone()),
+        };
+
+        let BuildOutcomeKind::Freeze(payload) = build_pool_payload(ctx, transactions) else {
+            panic!("Denim payload must freeze")
+        };
+        assert_eq!(payload.block().body().transactions.len(), 1);
+    }
+
+    #[test]
+    fn cancellation_takes_precedence_over_finalization() {
+        let ctx = pool_payload_context(DENIM_TIMESTAMP);
+        ctx.cancel.request_finalization();
+        drop(ctx.cancel.clone());
+
+        assert!(matches!(
+            build_pool_payload(ctx, NoopPayloadTransactions::<BasePooledTransaction>::default()),
+            BuildOutcomeKind::Cancelled
+        ));
     }
 }
