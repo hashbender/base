@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::U256;
 use base_common_genesis::BaseUpgrade;
-use tracing::info;
+use tracing::{debug, error, info};
 
-use crate::{AlloyUpgradeSignalReader, UpgradeSignalMetricLayer, UpgradeSignalMetrics};
+use crate::{
+    AlloyUpgradeSignalReader, UpgradeSignalMetricLayer, UpgradeSignalMetrics, UpgradeSignalRefresher,
+};
 
 /// L1 upgrade signal values for one contract-backed upgrade.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -72,22 +74,29 @@ impl UpgradeSignalStateUpdate {
     }
 }
 
-/// Stateful live metrics tracker for one contract-backed upgrade.
+/// Stateful live tracker for one contract-backed upgrade.
+///
+/// Two independent baselines are tracked: `observed` advances on every read and drives metrics and
+/// change detection, while `applied` advances only when a schedule is successfully committed to the
+/// runtime registry. Keeping them separate means a failed apply does not poison the baseline: the
+/// signal keeps being offered for apply until a commit actually succeeds.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct UpgradeSignalState {
-    /// Last signal read from L1 by the live metrics observer.
-    signal: Option<UpgradeSignal>,
+    /// Last signal read from L1 by the live observer.
+    observed: Option<UpgradeSignal>,
+    /// Last signal a successful apply committed to the runtime registry.
+    applied: Option<UpgradeSignal>,
 }
 
 impl UpgradeSignalState {
     /// Creates an empty upgrade signal state tracker.
     const fn new() -> Self {
-        Self { signal: None }
+        Self { observed: None, applied: None }
     }
 
-    /// Applies a newly read live signal.
+    /// Records a newly read live signal against the observed baseline.
     fn update_signal(&mut self, signal: UpgradeSignal) -> UpgradeSignalStateUpdate {
-        let update = match self.signal.as_ref() {
+        let update = match self.observed.as_ref() {
             Some(previous) if previous.has_same_contract_values(&signal) => {
                 UpgradeSignalStateUpdate::Unchanged
             }
@@ -95,18 +104,32 @@ impl UpgradeSignalState {
             None => UpgradeSignalStateUpdate::Initialized,
         };
 
-        self.signal = Some(signal);
+        self.observed = Some(signal);
         update
+    }
+
+    /// Returns true when `signal` has not yet been successfully applied.
+    fn needs_apply(&self, signal: &UpgradeSignal) -> bool {
+        self.applied.as_ref().is_none_or(|applied| !applied.has_same_contract_values(signal))
+    }
+
+    /// Advances the applied baseline after a successful commit.
+    fn mark_applied(&mut self, signal: &UpgradeSignal) {
+        self.applied = Some(signal.clone());
     }
 }
 
-/// Records live upgrade signal metrics without mutating node configuration.
+/// Records live upgrade signal metrics and, when a refresher is supplied, auto-applies observed
+/// schedule changes.
 #[derive(Debug, Clone)]
 pub struct UpgradeSignalMonitor {
     /// Metric layer recorded by this monitor.
     pub metrics_layer: UpgradeSignalMetricLayer,
-    /// Live metrics state by contract-backed upgrade.
+    /// Live metrics and apply state by contract-backed upgrade.
     states: BTreeMap<BaseUpgrade, UpgradeSignalState>,
+    /// Contract values of the last schedule that failed to apply, used to page only on the first
+    /// occurrence of a persistent failure rather than every poll.
+    last_apply_failure: Option<Vec<UpgradeSignal>>,
 }
 
 impl UpgradeSignalMonitor {
@@ -117,37 +140,85 @@ impl UpgradeSignalMonitor {
         for upgrade_id in BaseUpgrade::CONTRACT_VARIANTS {
             states.insert(upgrade_id, UpgradeSignalState::new());
         }
-        Self { metrics_layer, states }
+        Self { metrics_layer, states, last_apply_failure: None }
     }
 
-    /// Tolerantly polls the reader, records live metrics, and returns the schedule that was read
-    /// when any signals updated.
+    /// Tolerantly polls the reader, records live metrics, and — when `refresher` is supplied —
+    /// applies any schedule not yet successfully committed.
     ///
     /// This is the single live-poll routine shared by the consensus actor and the execution
-    /// metrics extension; read failures are recorded but do not abort the poll. See
-    /// [`UpgradeSignalStateUpdate::requires_apply`] for why a first observation counts as an
-    /// update.
-    pub async fn poll(
+    /// metrics extension. Read failures are recorded but do not abort the poll and do not advance
+    /// either baseline. The applied baseline advances only when [`UpgradeSignalRefresher::apply`]
+    /// succeeds, so a failed apply leaves the schedule offered for retry on the next poll; failures
+    /// increment `apply_failures_total`, raise the `apply_failed` gauge, and page once per distinct
+    /// failure.
+    pub async fn poll_and_apply(
         &mut self,
         reader: &AlloyUpgradeSignalReader,
-    ) -> Option<UpgradeSignalSchedule> {
-        let metrics_layers = [self.metrics_layer];
-        let schedule = reader.read_schedule_tolerant(&metrics_layers).await?;
-        let updated_signals = self
+        refresher: Option<&UpgradeSignalRefresher>,
+    ) {
+        let Some(schedule) = reader.read_schedule_tolerant(&[self.metrics_layer]).await else {
+            return;
+        };
+
+        let observed_changes = self
             .update_schedule(schedule.clone())
             .iter()
             .filter(|update| update.requires_apply())
             .count();
-        if updated_signals == 0 {
-            return None;
+        if observed_changes > 0 {
+            info!(
+                target: "upgrade_signal",
+                updated_signals = observed_changes,
+                "observed live L1 upgrade signal update"
+            );
         }
 
-        info!(
-            target: "upgrade_signal",
-            updated_signals,
-            "observed live L1 upgrade signal update"
-        );
-        Some(schedule)
+        let Some(refresher) = refresher else {
+            return;
+        };
+        if !self.schedule_needs_apply(&schedule) {
+            return;
+        }
+
+        match refresher.apply(&schedule) {
+            Ok(_) => {
+                self.mark_schedule_applied(&schedule);
+                self.last_apply_failure = None;
+                UpgradeSignalMetrics::record_apply_success(self.metrics_layer, &schedule);
+            }
+            Err(apply_error) => {
+                UpgradeSignalMetrics::record_apply_failure(self.metrics_layer, &schedule);
+                if self.last_apply_failure.as_deref() != Some(schedule.signals.as_slice()) {
+                    error!(
+                        target: "upgrade_signal",
+                        error = %apply_error,
+                        "failed to auto-apply live upgrade signal update"
+                    );
+                    self.last_apply_failure = Some(schedule.signals.clone());
+                } else {
+                    debug!(
+                        target: "upgrade_signal",
+                        error = %apply_error,
+                        "live upgrade signal still failing to apply"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Returns true when any signal in `schedule` has not yet been successfully applied.
+    fn schedule_needs_apply(&self, schedule: &UpgradeSignalSchedule) -> bool {
+        schedule.signals.iter().any(|signal| {
+            self.states.get(&signal.upgrade_id).is_none_or(|state| state.needs_apply(signal))
+        })
+    }
+
+    /// Advances the applied baseline for every signal in a successfully committed schedule.
+    fn mark_schedule_applied(&mut self, schedule: &UpgradeSignalSchedule) {
+        for signal in &schedule.signals {
+            self.states.entry(signal.upgrade_id).or_default().mark_applied(signal);
+        }
     }
 
     /// Applies signals read from L1 and records corresponding live metrics.
@@ -277,5 +348,76 @@ mod tests {
         monitor.update_schedule(schedule(10));
 
         assert_eq!(monitor.update_schedule(schedule(12)), vec![UpgradeSignalStateUpdate::Changed]);
+    }
+
+    #[test]
+    fn state_needs_apply_until_marked_applied() {
+        let mut state = UpgradeSignalState::new();
+        let signal = signal(10);
+
+        // Never applied: needs apply even before it has been observed.
+        assert!(state.needs_apply(&signal));
+
+        // Observing the signal advances the observed baseline but not the applied baseline.
+        state.update_signal(signal.clone());
+        assert!(state.needs_apply(&signal));
+
+        // Only a successful apply advances the applied baseline.
+        state.mark_applied(&signal);
+        assert!(!state.needs_apply(&signal));
+    }
+
+    #[test]
+    fn state_changed_signal_needs_apply_after_previous_applied() {
+        let mut state = UpgradeSignalState::new();
+
+        state.mark_applied(&signal(10));
+
+        assert!(!state.needs_apply(&signal(10)));
+        assert!(state.needs_apply(&signal(12)));
+    }
+
+    #[test]
+    fn failed_apply_keeps_schedule_offered_for_retry() {
+        let mut monitor = monitor();
+        let schedule = schedule(10);
+
+        // Mirror `poll_and_apply`: observe first (advances the observed baseline), then a failed
+        // apply must NOT advance the applied baseline, so the schedule is offered again next poll.
+        monitor.update_schedule(schedule.clone());
+        assert!(
+            monitor.schedule_needs_apply(&schedule),
+            "an unapplied schedule must remain offered for retry"
+        );
+
+        // A subsequent successful apply advances the applied baseline and stops the retries.
+        monitor.mark_schedule_applied(&schedule);
+        assert!(!monitor.schedule_needs_apply(&schedule));
+    }
+
+    #[test]
+    fn l1_change_after_failed_apply_is_offered() {
+        let mut monitor = monitor();
+
+        // Observe v1 and leave it unapplied (apply failed).
+        monitor.update_schedule(schedule(10));
+        assert!(monitor.schedule_needs_apply(&schedule(10)));
+
+        // L1 then changes to v2, which must still be offered for apply.
+        monitor.update_schedule(schedule(12));
+        assert!(monitor.schedule_needs_apply(&schedule(12)));
+    }
+
+    #[test]
+    fn applied_schedule_is_not_reoffered() {
+        let mut monitor = monitor();
+        let schedule = schedule(10);
+
+        monitor.update_schedule(schedule.clone());
+        monitor.mark_schedule_applied(&schedule);
+
+        // The same contract values, even at a new L1 block number, are not re-offered.
+        let same_values_new_block = UpgradeSignalSchedule::new(2, vec![signal(10)]);
+        assert!(!monitor.schedule_needs_apply(&same_values_new_block));
     }
 }

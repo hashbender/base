@@ -24,7 +24,7 @@ use tokio::{
     task::JoinHandle,
     time::{MissedTickBehavior, interval},
 };
-use tracing::{info, warn};
+use tracing::info;
 use url::Url;
 
 use super::in_process_consensus::wait_for_rpc;
@@ -197,18 +197,7 @@ impl InProcessFollowConsensus {
 
             loop {
                 poll_interval.tick().await;
-                let Some(schedule) = monitor.poll(&reader).await else {
-                    continue;
-                };
-                if let Some(refresher) = &refresher
-                    && let Err(error) = refresher.apply(&schedule)
-                {
-                    warn!(
-                        target: "upgrade_signal",
-                        error = %error,
-                        "failed to auto-apply follow-mode upgrade signal update"
-                    );
-                }
+                monitor.poll_and_apply(&reader, refresher.as_ref()).await;
             }
         }))
     }

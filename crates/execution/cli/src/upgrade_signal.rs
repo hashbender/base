@@ -3,8 +3,8 @@
 use base_execution_chainspec::BaseChainSpec;
 use base_node_runner::{BaseNodeExtension, BaseRpcContext, FromExtensionConfig, NodeHooks};
 use base_upgrade_signal::{
-    UpgradeSignalApplySummary, UpgradeSignalConfig, UpgradeSignalMetricLayer, UpgradeSignalMonitor,
-    UpgradeSignalRefresher, UpgradeSignalRuntimeApplier, UpgradeSignalSchedule,
+    UpgradeSignalApplySummary, UpgradeSignalConfig, UpgradeSignalMetricLayer, UpgradeSignalMetrics,
+    UpgradeSignalMonitor, UpgradeSignalRefresher, UpgradeSignalRuntimeApplier, UpgradeSignalSchedule,
 };
 use jsonrpsee::{RpcModule, core::RpcResult, types::ErrorObject};
 use reth_chainspec::EthChainSpec;
@@ -65,6 +65,7 @@ impl ExecutionUpgradeSignal {
     ) -> RpcResult<UpgradeSignalApplySummary> {
         match refresher.read_schedule().await {
             Ok(schedule) => refresher.apply(&schedule).map_err(|error| {
+                UpgradeSignalMetrics::record_apply_failure(refresher.metrics_layer, &schedule);
                 warn!(
                     target: "upgrade_signal",
                     error = %error,
@@ -167,18 +168,7 @@ impl BaseNodeExtension for ExecutionUpgradeSignalRuntimeExtension {
                             _ = interval.tick() => {
                                 tokio::select! {
                                     _ = &mut signal => break,
-                                    polled = monitor.poll(&reader) => {
-                                        if let Some(refresher) = &auto_refresher
-                                            && let Some(schedule) = polled
-                                            && let Err(error) = refresher.apply(&schedule)
-                                        {
-                                            warn!(
-                                                target: "upgrade_signal",
-                                                error = %error,
-                                                "failed to auto-apply live upgrade signal update"
-                                            );
-                                        }
-                                    }
+                                    _ = monitor.poll_and_apply(&reader, auto_refresher.as_ref()) => {}
                                 }
                             }
                         }

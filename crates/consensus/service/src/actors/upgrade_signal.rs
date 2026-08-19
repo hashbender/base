@@ -7,7 +7,6 @@ use base_upgrade_signal::{
     UpgradeSignalMonitor, UpgradeSignalRefresher,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 use url::Url;
 
 use crate::NodeActor;
@@ -97,18 +96,7 @@ impl UpgradeSignalMetricsActor {
     /// Polls L1 upgrade signal state, records metrics, and auto-applies observed changes when
     /// runtime refresh is enabled.
     pub async fn poll_l1_signal(&mut self) {
-        let Some(schedule) = self.monitor.poll(&self.reader).await else {
-            return;
-        };
-        if let Some(refresher) = &self.refresher
-            && let Err(error) = refresher.apply(&schedule)
-        {
-            warn!(
-                target: "upgrade_signal",
-                error = %error,
-                "failed to auto-apply live upgrade signal update"
-            );
-        }
+        self.monitor.poll_and_apply(&self.reader, self.refresher.as_ref()).await;
     }
 }
 
