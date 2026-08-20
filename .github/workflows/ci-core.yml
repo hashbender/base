@@ -44,7 +44,7 @@ permissions:
 jobs:
   changes:
     name: Detect Docker Changes
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     permissions:
       contents: read
       pull-requests: read
@@ -69,7 +69,7 @@ jobs:
 
   metadata-checks:
     name: Metadata Checks
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -90,7 +90,7 @@ jobs:
 
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -109,8 +109,7 @@ jobs:
 
   build:
     name: Build
-    runs-on:
-      group: BasePerfRunnerGroup
+    runs-on: tenki-standard-large-plus-16c-32g
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:
@@ -137,8 +136,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on:
-      group: BasePerfRunnerGroup
+    runs-on: tenki-standard-large-plus-16c-32g
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:
@@ -165,8 +163,7 @@ jobs:
 
   test:
     name: Test
-    runs-on:
-      group: BasePerfRunnerGroup
+    runs-on: tenki-standard-large-plus-16c-32g
     env:
       BASE_REF: ${{ inputs.base_ref }}
     steps:
@@ -211,7 +208,7 @@ jobs:
 
   bench:
     name: Benchmarks
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -229,7 +226,7 @@ jobs:
 
   docker:
     name: Docker
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     needs: changes
     if: needs.changes.outputs.docker == 'true'
     permissions:
@@ -259,7 +256,7 @@ jobs:
   test-musl-sigsegv:
     name: Test SIGSEGV (musl)
     if: inputs.run_sigsegv
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-medium-4c-8g
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -279,8 +276,7 @@ jobs:
   system-tests:
     name: System Tests
     if: inputs.run_system_tests
-    runs-on:
-      group: BasePerfRunnerGroup
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 60
     steps:
       - name: Harden the runner (Audit all outbound calls)

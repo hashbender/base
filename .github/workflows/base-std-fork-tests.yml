@@ -26,8 +26,7 @@ permissions:
 jobs:
   fork-tests:
     name: Base Std Interface Tests
-    runs-on:
-      group: BasePerfRunnerGroup
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 120
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -52,7 +51,7 @@ jobs:
         env:
           # BASE_STD_TOKEN must be a PAT with Contents:Read on base/base-std.
           # GITHUB_TOKEN is repo-scoped and cannot access other repos, even internal ones.
-          GH_TOKEN: ${{ secrets.BASE_STD_TOKEN }}
+          GH_TOKEN: ${{ github.repository == 'base/base' && secrets.BASE_STD_TOKEN || github.token }}
         run: |
           set -euo pipefail
 
